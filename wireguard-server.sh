@@ -1,1052 +1,449 @@
 #!/bin/bash
-# https://github.com/complexorganizations/wireguard-manager
 
-# Require script to be run as root (or with sudo)
-function super-user-check() {
-  if [ "$EUID" -ne 0 ]; then
-    echo "You need to run this script as super user."
-    exit
-  fi
+# Secure WireGuard server installer for Debian, Ubuntu, CentOS, Fedora and Arch Linux
+# https://github.com/angristan/wireguard-install
+
+RED='\033[0;31m'
+ORANGE='\033[0;33m'
+NC='\033[0m'
+
+function isRoot() {
+	if [ "${EUID}" -ne 0 ]; then
+		echo "You need to run this script as root"
+		exit 1
+	fi
 }
 
-# Check for root
-super-user-check
+function checkVirt() {
+	if [ "$(systemd-detect-virt)" == "openvz" ]; then
+		echo "OpenVZ is not supported"
+		exit 1
+	fi
 
-# Checking For Virtualization
-function virt-check() {
-  # Deny OpenVZ Virtualization
-  if [ "$(systemd-detect-virt)" == "openvz" ]; then
-    echo "OpenVZ virtualization is not supported (yet)."
-    exit
-  fi
-  # Deny LXC Virtualization
-  if [ "$(systemd-detect-virt)" == "lxc" ]; then
-    echo "LXC virtualization is not supported (yet)."
-    exit
-  fi
-  # Deny Docker
-  if [ -f /.dockerenv ]; then
-    echo "Docker is not supported (yet)."
-    exit
-  fi
+	if [ "$(systemd-detect-virt)" == "lxc" ]; then
+		echo "LXC is not supported (yet)."
+		echo "WireGuard can technically run in an LXC container,"
+		echo "but the kernel module has to be installed on the host,"
+		echo "the container has to be run with some specific parameters"
+		echo "and only the tools need to be installed in the container."
+		exit 1
+	fi
 }
 
-# Virtualization Check
-virt-check
-
-# Pre-Checks
-function check-system-requirements() {
-  # System requirements (iptables)
-  if ! [ -x "$(command -v iptables)" ]; then
-    echo "Error: iptables is not installed, please install iptables." >&2
-    exit
-  fi
-  # System requirements (curl)
-  if ! [ -x "$(command -v curl)" ]; then
-    echo "Error: curl is not installed, please install curl." >&2
-    exit
-  fi
-  # System requirements (ip)
-  if ! [ -x "$(command -v ip)" ]; then
-    echo "Error: ip is not installed, please install ip." >&2
-    exit
-  fi
-  # System requirements (shuf)
-  if ! [ -x "$(command -v shuf)" ]; then
-    echo "Error: shuf is not installed, please install shuf." >&2
-    exit
-  fi
-  # System requirements (bc)
-  if ! [ -x "$(command -v bc)" ]; then
-    echo "Error: bc  is not installed, please install bc." >&2
-    exit
-  fi
-  # System requirements (uname)
-  if ! [ -x "$(command -v uname)" ]; then
-    echo "Error: uname  is not installed, please install uname." >&2
-    exit
-  fi
-  # System requirements (jq)
-  if ! [ -x "$(command -v jq)" ]; then
-    echo "Error: jq  is not installed, please install jq." >&2
-    exit
-  fi
-  # System requirements (sed)
-  if ! [ -x "$(command -v sed)" ]; then
-    echo "Error: sed  is not installed, please install sed." >&2
-    exit
-  fi
+function checkOS() {
+	# Check OS version
+	if [[ -e /etc/debian_version ]]; then
+		source /etc/os-release
+		OS="${ID}" # debian or ubuntu
+		if [[ ${ID} == "debian" || ${ID} == "raspbian" ]]; then
+			if [[ ${VERSION_ID} -ne 10 ]]; then
+				echo "Your version of Debian (${VERSION_ID}) is not supported. Please use Debian 10 Buster"
+				exit 1
+			fi
+		fi
+	elif [[ -e /etc/fedora-release ]]; then
+		source /etc/os-release
+		OS="${ID}"
+	elif [[ -e /etc/centos-release ]]; then
+		source /etc/os-release
+		OS=centos
+	elif [[ -e /etc/arch-release ]]; then
+		OS=arch
+	else
+		echo "Looks like you aren't running this installer on a Debian, Ubuntu, Fedora, CentOS or Arch Linux system"
+		exit 1
+	fi
 }
 
-# Run the function and check for requirements
-check-system-requirements
+function initialCheck() {
+	isRoot
+	checkVirt
+	checkOS
+}
 
-# Lets check the kernel version
-function kernel-check() {
-KERNEL_VERSION_LIMIT=3.1
-KERNEL_CURRENT_VERSION=$(uname -r | cut -c1-3)
-if (( $(echo "$KERNEL_CURRENT_VERSION > $KERNEL_VERSION_LIMIT" |bc -l) )); then
-    echo "Correct: Kernel version, $KERNEL_CURRENT_VERSION" >/dev/null 2>&1
+function installQuestions() {
+	echo "Welcome to the WireGuard installer!"
+	echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+	echo ""
+	echo "I need to ask you a few questions before starting the setup."
+	echo "You can leave the default options and just press enter if you are ok with them."
+	echo ""
+
+	# Detect public IPv4 or IPv6 address and pre-fill for the user
+	SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+	if [[ -z ${SERVER_PUB_IP} ]]; then
+		# Detect public IPv6 address
+		SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+	fi
+	read -rp "IPv4 or IPv6 public address: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+
+	# Detect public interface and pre-fill for the user
+	SERVER_NIC="$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)"
+	until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
+		read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
+	done
+
+	until [[ ${SERVER_WG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_WG_NIC} -lt 16 ]]; do
+		read -rp "WireGuard interface name: " -e -i wg0 SERVER_WG_NIC
+	done
+
+	until [[ ${SERVER_WG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
+		read -rp "Server's WireGuard IPv4: " -e -i 10.66.66.1 SERVER_WG_IPV4
+	done
+
+	until [[ ${SERVER_WG_IPV6} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
+		read -rp "Server's WireGuard IPv6: " -e -i fd42:42:42::1 SERVER_WG_IPV6
+	done
+
+	# Generate random number within private ports range
+	RANDOM_PORT=$(shuf -i49152-65535 -n1)
+	until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
+		read -rp "Server's WireGuard port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT
+	done
+
+	# Adguard DNS by default
+	until [[ ${CLIENT_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+		read -rp "First DNS resolver to use for the clients: " -e -i 94.140.14.14 CLIENT_DNS_1
+	done
+	until [[ ${CLIENT_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
+		read -rp "Second DNS resolver to use for the clients (optional): " -e -i 94.140.15.15 CLIENT_DNS_2
+		if [[ ${CLIENT_DNS_2} == "" ]]; then
+			CLIENT_DNS_2="${CLIENT_DNS_1}"
+		fi
+	done
+
+	echo ""
+	echo "Okay, that was all I needed. We are ready to setup your WireGuard server now."
+	echo "You will be able to generate a client at the end of the installation."
+	read -n1 -r -p "Press any key to continue..."
+}
+
+function installWireGuard() {
+	# Run setup questions first
+	installQuestions
+
+	# Install WireGuard tools and module
+	if [[ ${OS} == 'ubuntu' ]]; then
+		apt-get update
+		apt-get install -y wireguard iptables resolvconf qrencode
+	elif [[ ${OS} == 'debian' ]]; then
+		if ! grep -rqs "^deb .* buster-backports" /etc/apt/; then
+			echo "deb http://deb.debian.org/debian buster-backports main" >/etc/apt/sources.list.d/backports.list
+			apt-get update
+		fi
+		apt update
+		apt-get install -y iptables resolvconf qrencode
+		apt-get install -y -t buster-backports wireguard
+	elif [[ ${OS} == 'fedora' ]]; then
+		if [[ ${VERSION_ID} -lt 32 ]]; then
+			dnf install -y dnf-plugins-core
+			dnf copr enable -y jdoss/wireguard
+			dnf install -y wireguard-dkms
+		fi
+		dnf install -y wireguard-tools iptables qrencode
+	elif [[ ${OS} == 'centos' ]]; then
+		yum -y install epel-release elrepo-release
+		if [[ ${VERSION_ID} -eq 7 ]]; then
+			yum -y install yum-plugin-elrepo
+		fi
+		yum -y install kmod-wireguard wireguard-tools iptables qrencode
+	elif [[ ${OS} == 'arch' ]]; then
+		# Check if current running kernel is LTS
+		ARCH_KERNEL_RELEASE=$(uname -r)
+		if [[ ${ARCH_KERNEL_RELEASE} == *lts* ]]; then
+			pacman -S --needed --noconfirm linux-lts-headers
+		else
+			pacman -S --needed --noconfirm linux-headers
+		fi
+		pacman -S --needed --noconfirm wireguard-tools iptables qrencode
+	fi
+
+	# Make sure the directory exists (this does not seem the be the case on fedora)
+	mkdir /etc/wireguard >/dev/null 2>&1
+
+	chmod 600 -R /etc/wireguard/
+
+	SERVER_PRIV_KEY=$(wg genkey)
+	SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | wg pubkey)
+
+	# Save WireGuard settings
+	echo "SERVER_PUB_IP=${SERVER_PUB_IP}
+SERVER_PUB_NIC=${SERVER_PUB_NIC}
+SERVER_WG_NIC=${SERVER_WG_NIC}
+SERVER_WG_IPV4=${SERVER_WG_IPV4}
+SERVER_WG_IPV6=${SERVER_WG_IPV6}
+SERVER_PORT=${SERVER_PORT}
+SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
+SERVER_PUB_KEY=${SERVER_PUB_KEY}
+CLIENT_DNS_1=${CLIENT_DNS_1}
+CLIENT_DNS_2=${CLIENT_DNS_2}" >/etc/wireguard/params
+
+	# Add server interface
+	echo "[Interface]
+Address = ${SERVER_WG_IPV4}/24,${SERVER_WG_IPV6}/64
+ListenPort = ${SERVER_PORT}
+PrivateKey = ${SERVER_PRIV_KEY}" >"/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+	if pgrep firewalld; then
+		FIREWALLD_IPV4_ADDRESS=$(echo "${SERVER_WG_IPV4}" | cut -d"." -f1-3)".0"
+		FIREWALLD_IPV6_ADDRESS=$(echo "${SERVER_WG_IPV6}" | sed 's/:[^:]*$/:0/')
+		echo "PostUp = firewall-cmd --add-port ${SERVER_PORT}/udp && firewall-cmd --add-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --add-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'
+PostDown = firewall-cmd --remove-port ${SERVER_PORT}/udp && firewall-cmd --remove-rich-rule='rule family=ipv4 source address=${FIREWALLD_IPV4_ADDRESS}/24 masquerade' && firewall-cmd --remove-rich-rule='rule family=ipv6 source address=${FIREWALLD_IPV6_ADDRESS}/24 masquerade'" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+	else
+		echo "PostUp = iptables -A FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT; iptables -A FORWARD -i ${SERVER_WG_NIC} -j ACCEPT; iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE; ip6tables -A FORWARD -i ${SERVER_WG_NIC} -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_WG_NIC} -j ACCEPT; iptables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT; iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE; ip6tables -D FORWARD -i ${SERVER_WG_NIC} -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+	fi
+
+	# Enable routing on the server
+	echo "net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1" >/etc/sysctl.d/wg.conf
+
+	sysctl --system
+
+	systemctl start "wg-quick@${SERVER_WG_NIC}"
+	systemctl enable "wg-quick@${SERVER_WG_NIC}"
+
+	newClient
+	echo "If you want to add more clients, you simply need to run this script another time!"
+
+	# Check if WireGuard is running
+	systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
+	WG_RUNNING=$?
+
+	# WireGuard might not work if we updated the kernel. Tell the user to reboot
+	if [[ ${WG_RUNNING} -ne 0 ]]; then
+		echo -e "\n${RED}WARNING: WireGuard does not seem to be running.${NC}"
+		echo -e "${ORANGE}You can check if WireGuard is running with: systemctl status wg-quick@${SERVER_WG_NIC}${NC}"
+		echo -e "${ORANGE}If you get something like \"Cannot find device ${SERVER_WG_NIC}\", please reboot!${NC}"
+	fi
+}
+
+function newClient() {
+	ENDPOINT="${SERVER_PUB_IP}:${SERVER_PORT}"
+
+	echo ""
+	echo "Tell me a name for the client."
+	echo "The name must consist of alphanumeric character. It may also include an underscore or a dash and can't exceed 15 chars."
+
+	until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
+		read -rp "Client name: " -e CLIENT_NAME
+		CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+
+		if [[ ${CLIENT_EXISTS} == '1' ]]; then
+			echo ""
+			echo "A client with the specified name was already created, please choose another name."
+			echo ""
+		fi
+	done
+
+	for DOT_IP in {2..254}; do
+		DOT_EXISTS=$(grep -c "${SERVER_WG_IPV4::-1}${DOT_IP}" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+		if [[ ${DOT_EXISTS} == '0' ]]; then
+			break
+		fi
+	done
+
+	if [[ ${DOT_EXISTS} == '1' ]]; then
+		echo ""
+		echo "The subnet configured supports only 253 clients."
+		exit 1
+	fi
+
+	BASE_IP=$(echo "$SERVER_WG_IPV4" | awk -F '.' '{ print $1"."$2"."$3 }')
+	until [[ ${IPV4_EXISTS} == '0' ]]; do
+		read -rp "Client's WireGuard IPv4: ${BASE_IP}." -e -i "${DOT_IP}" DOT_IP
+		CLIENT_WG_IPV4="${BASE_IP}.${DOT_IP}"
+		IPV4_EXISTS=$(grep -c "$CLIENT_WG_IPV4/24" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+
+		if [[ ${IPV4_EXISTS} == '1' ]]; then
+			echo ""
+			echo "A client with the specified IPv4 was already created, please choose another IPv4."
+			echo ""
+		fi
+	done
+
+	BASE_IP=$(echo "$SERVER_WG_IPV6" | awk -F '::' '{ print $1 }')
+	until [[ ${IPV6_EXISTS} == '0' ]]; do
+		read -rp "Client's WireGuard IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" DOT_IP
+		CLIENT_WG_IPV6="${BASE_IP}::${DOT_IP}"
+		IPV6_EXISTS=$(grep -c "${CLIENT_WG_IPV6}/64" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+
+		if [[ ${IPV6_EXISTS} == '1' ]]; then
+			echo ""
+			echo "A client with the specified IPv6 was already created, please choose another IPv6."
+			echo ""
+		fi
+	done
+
+	# Generate key pair for the client
+	CLIENT_PRIV_KEY=$(wg genkey)
+	CLIENT_PUB_KEY=$(echo "${CLIENT_PRIV_KEY}" | wg pubkey)
+	CLIENT_PRE_SHARED_KEY=$(wg genpsk)
+
+	# Home directory of the user, where the client configuration will be written
+	if [ -e "/home/${CLIENT_NAME}" ]; then
+		# if $1 is a user name
+		HOME_DIR="/home/${CLIENT_NAME}"
+	elif [ "${SUDO_USER}" ]; then
+		# if not, use SUDO_USER
+		if [ "${SUDO_USER}" == "root" ]; then
+			# If running sudo as root
+			HOME_DIR="/root"
+		else
+			HOME_DIR="/home/${SUDO_USER}"
+		fi
+	else
+		# if not SUDO_USER, use /root
+		HOME_DIR="/root"
+	fi
+
+	# Create client file and add the server as a peer
+	echo "[Interface]
+PrivateKey = ${CLIENT_PRIV_KEY}
+Address = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128
+DNS = ${CLIENT_DNS_1},${CLIENT_DNS_2}
+
+[Peer]
+PublicKey = ${SERVER_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+Endpoint = ${ENDPOINT}
+AllowedIPs = 0.0.0.0/0,::/0" >>"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+
+	# Add the client as a peer to the server
+	echo -e "\n### Client ${CLIENT_NAME}
+[Peer]
+PublicKey = ${CLIENT_PUB_KEY}
+PresharedKey = ${CLIENT_PRE_SHARED_KEY}
+AllowedIPs = ${CLIENT_WG_IPV4}/32,${CLIENT_WG_IPV6}/128" >>"/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+	systemctl restart "wg-quick@${SERVER_WG_NIC}"
+
+	echo -e "\nHere is your client config file as a QR Code:"
+
+	qrencode -t ansiutf8 -l L <"${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+
+	echo "It is also available in ${HOME_DIR}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+}
+
+function revokeClient() {
+	NUMBER_OF_CLIENTS=$(grep -c -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf")
+	if [[ ${NUMBER_OF_CLIENTS} == '0' ]]; then
+		echo ""
+		echo "You have no existing clients!"
+		exit 1
+	fi
+
+	echo ""
+	echo "Select the existing client you want to revoke"
+	grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | nl -s ') '
+	until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
+		if [[ ${CLIENT_NUMBER} == '1' ]]; then
+			read -rp "Select one client [1]: " CLIENT_NUMBER
+		else
+			read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
+		fi
+	done
+
+	# match the selected number to a client name
+	CLIENT_NAME=$(grep -E "^### Client" "/etc/wireguard/${SERVER_WG_NIC}.conf" | cut -d ' ' -f 3 | sed -n "${CLIENT_NUMBER}"p)
+
+	# remove [Peer] block matching $CLIENT_NAME
+	sed -i "/^### Client ${CLIENT_NAME}\$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+
+	# remove generated client file
+	rm -f "${HOME}/${SERVER_WG_NIC}-client-${CLIENT_NAME}.conf"
+
+	# restart wireguard to apply changes
+	systemctl restart "wg-quick@${SERVER_WG_NIC}"
+}
+
+function uninstallWg() {
+	echo ""
+	read -rp "Do you really want to remove WireGuard? [y/n]: " -e -i n REMOVE
+	if [[ $REMOVE == 'y' ]]; then
+		checkOS
+
+		systemctl stop "wg-quick@${SERVER_WG_NIC}"
+		systemctl disable "wg-quick@${SERVER_WG_NIC}"
+
+		if [[ ${OS} == 'ubuntu' ]]; then
+			apt-get autoremove --purge -y wireguard qrencode
+		elif [[ ${OS} == 'debian' ]]; then
+			apt-get autoremove --purge -y wireguard qrencode
+		elif [[ ${OS} == 'fedora' ]]; then
+			dnf remove -y wireguard-tools qrencode
+			if [[ ${VERSION_ID} -lt 32 ]]; then
+				dnf remove -y wireguard-dkms
+				dnf copr disable -y jdoss/wireguard
+			fi
+			dnf autoremove -y
+		elif [[ ${OS} == 'centos' ]]; then
+			yum -y remove kmod-wireguard wireguard-tools qrencode
+			yum -y autoremove
+		elif [[ ${OS} == 'arch' ]]; then
+			pacman -Rs --noconfirm wireguard-tools qrencode
+		fi
+
+		rm -rf /etc/wireguard
+		rm -f /etc/sysctl.d/wg.conf
+
+		# Reload sysctl
+		sysctl --system
+
+		# Check if WireGuard is running
+		systemctl is-active --quiet "wg-quick@${SERVER_WG_NIC}"
+		WG_RUNNING=$?
+
+		if [[ ${WG_RUNNING} -eq 0 ]]; then
+			echo "WireGuard failed to uninstall properly."
+			exit 1
+		else
+			echo "WireGuard uninstalled successfully."
+			exit 0
+		fi
+	else
+		echo ""
+		echo "Removal aborted!"
+	fi
+}
+
+function manageMenu() {
+	echo "Welcome to WireGuard-install!"
+	echo "The git repository is available at: https://github.com/angristan/wireguard-install"
+	echo ""
+	echo "It looks like WireGuard is already installed."
+	echo ""
+	echo "What do you want to do?"
+	echo "   1) Add a new user"
+	echo "   2) Revoke existing user"
+	echo "   3) Uninstall WireGuard"
+	echo "   4) Exit"
+	until [[ ${MENU_OPTION} =~ ^[1-4]$ ]]; do
+		read -rp "Select an option [1-4]: " MENU_OPTION
+	done
+	case "${MENU_OPTION}" in
+	1)
+		newClient
+		;;
+	2)
+		revokeClient
+		;;
+	3)
+		uninstallWg
+		;;
+	4)
+		exit 0
+		;;
+	esac
+}
+
+# Check for root, virt, OS...
+initialCheck
+
+# Check if WireGuard is already installed and load params
+if [[ -e /etc/wireguard/params ]]; then
+	source /etc/wireguard/params
+	manageMenu
 else
-    echo "Error: Kernel version $KERNEL_CURRENT_VERSION please update to $KERNEL_VERSION_LIMIT" >&2
-    exit
-fi
-}
-
-# Kernel Version
-#kernel-check
-
-# Detect Operating System
-function dist-check() {
-  # shellcheck disable=SC1090
-  if [ -e /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    source /etc/os-release
-    DISTRO=$ID
-    # shellcheck disable=SC2034
-    DISTRO_VERSION=$VERSION_ID
-  fi
-}
-
-# Check Operating System
-dist-check
-
-function usage-guide() {
-  # shellcheck disable=SC2027,SC2046
-  echo "usage: ./"$(basename "$0")" [options]"
-  echo "  --install     Install WireGuard Interfacee"
-  echo "  --start       Start WireGuard Interface"
-  echo "  --stop        Stop WireGuard Interface"
-  echo "  --restart     Restart WireGuard Interface"
-  echo "  --list        Show WireGuard Peers"
-  echo "  --add         Add WireGuard Peer"
-  echo "  --remove      Remove WireGuard Peer"
-  echo "  --reinstall   Reinstall WireGuard Interface"
-  echo "  --uninstall   Uninstall WireGuard Interface"
-  echo "  --update      Update WireGuard Script"
-  echo "  --help        Show Usage Guide"
-  exit
-}
-
-function usage() {
-  while [ $# -ne 0 ]; do
-    case "${1}" in
-    --install)
-      shift
-      HEADLESS_INSTALL=${HEADLESS_INSTALL:-y}
-      ;;
-    --start)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-2}
-      ;;
-    --stop)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-3}
-      ;;
-    --restart)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-4}
-      ;;
-    --list)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-1}
-      ;;
-    --add)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-5}
-      ;;
-    --remove)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-6}
-      ;;
-    --reinstall)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-7}
-      ;;
-    --uninstall)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-8}
-      ;;
-    --update)
-      shift
-      WIREGUARD_OPTIONS=${WIREGUARD_OPTIONS:-9}
-      ;;
-    --help)
-      shift
-      usage-guide
-      ;;
-    *)
-      echo "Invalid argument: $1"
-      usage-guide
-      exit
-      ;;
-    esac
-    shift
-  done
-}
-
-usage "$@"
-
-# Skips all questions and just get a client conf after install.
-function headless-install() {
-  if [ "$HEADLESS_INSTALL" == "y" ]; then
-    IPV4_SUBNET_SETTINGS=${IPV4_SUBNET_SETTINGS:-1}
-    IPV6_SUBNET_SETTINGS=${IPV6_SUBNET_SETTINGS:-1}
-    SERVER_HOST_V4_SETTINGS=${SERVER_HOST_V4_SETTINGS:-1}
-    SERVER_HOST_V6_SETTINGS=${SERVER_HOST_V6_SETTINGS:-1}
-    SERVER_PUB_NIC_SETTINGS=${SERVER_PUB_NIC_SETTINGS:-1}
-    SERVER_PORT_SETTINGS=${SERVER_PORT_SETTINGS:-1}
-    NAT_CHOICE_SETTINGS=${NAT_CHOICE_SETTINGS:-1}
-    MTU_CHOICE_SETTINGS=${MTU_CHOICE_SETTINGS:-1}
-    SERVER_HOST_SETTINGS=${SERVER_HOST_SETTINGS:-1}
-    DISABLE_HOST_SETTINGS=${DISABLE_HOST_SETTINGS:-1}
-    CLIENT_ALLOWED_IP_SETTINGS=${CLIENT_ALLOWED_IP_SETTINGS:-1}
-    INSTALL_UNBOUND=${INSTALL_UNBOUND:-y}
-    CLIENT_NAME=${CLIENT_NAME:-client}
-  fi
-}
-
-# No GUI
-headless-install
-
-# Wireguard Public Network Interface
-WIREGUARD_PUB_NIC="wg0"
-# Location For WG_CONFIG
-WG_CONFIG="/etc/wireguard/$WIREGUARD_PUB_NIC.conf"
-if [ ! -f "$WG_CONFIG" ]; then
-
-  # Custom subnet
-  function set-ipv4-subnet() {
-    echo "What ipv4 subnet do you want to use?"
-    echo "  1) 10.8.0.0/24 (Recommended)"
-    echo "  2) 10.0.0.0/24"
-    echo "  3) Custom (Advanced)"
-    until [[ "$IPV4_SUBNET_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "Subnetwork choice [1-3]: " -e -i 1 IPV4_SUBNET_SETTINGS
-    done
-    # Apply port response
-    case $IPV4_SUBNET_SETTINGS in
-    1)
-      IPV4_SUBNET="10.8.0.0/24"
-      ;;
-    2)
-      IPV4_SUBNET="10.0.0.0/24"
-      ;;
-    3)
-      read -rp "Custom Subnet: " -e -i "10.8.0.0/24" IPV4_SUBNET
-      ;;
-    esac
-  }
-
-  # Custom Subnet
-  set-ipv4-subnet
-
-  # Custom subnet
-  function set-ipv6-subnet() {
-    echo "What ipv6 subnet do you want to use?"
-    echo "  1) fd42:42:42::0/64 (Recommended)"
-    echo "  2) fd86:ea04:1115::0/64"
-    echo "  3) Custom (Advanced)"
-    until [[ "$IPV6_SUBNET_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "Subnetwork choice [1-3]: " -e -i 1 IPV6_SUBNET_SETTINGS
-    done
-    # Apply port response
-    case $IPV6_SUBNET_SETTINGS in
-    1)
-      IPV6_SUBNET="fd42:42:42::0/64"
-      ;;
-    2)
-      IPV6_SUBNET="fd86:ea04:1115::0/64"
-      ;;
-    3)
-      read -rp "Custom Subnet: " -e -i "fd42:42:42::0/64" IPV6_SUBNET
-      ;;
-    esac
-  }
-
-  # Custom Subnet
-  set-ipv6-subnet
-
-  # Private Subnet Ipv4
-  PRIVATE_SUBNET_V4=${PRIVATE_SUBNET_V4:-"$IPV4_SUBNET"}
-  # Private Subnet Mask IPv4
-  PRIVATE_SUBNET_MASK_V4=$(echo "$PRIVATE_SUBNET_V4" | cut -d "/" -f 2)
-  # IPv4 Getaway
-  GATEWAY_ADDRESS_V4="${PRIVATE_SUBNET_V4::-4}1"
-  # Private Subnet Ipv6
-  PRIVATE_SUBNET_V6=${PRIVATE_SUBNET_V6:-"$IPV6_SUBNET"}
-  # Private Subnet Mask IPv6
-  PRIVATE_SUBNET_MASK_V6=$(echo "$PRIVATE_SUBNET_V6" | cut -d "/" -f 2)
-  # IPv6 Getaway
-  GATEWAY_ADDRESS_V6="${PRIVATE_SUBNET_V6::-4}1"
-
-  # Determine host port
-  function test-connectivity-v4() {
-    echo "How would you like to detect IPV4?"
-    echo "  1) Curl (Recommended)"
-    echo "  2) IP (Advanced)"
-    echo "  3) Custom (Advanced)"
-    until [[ "$SERVER_HOST_V4_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "ipv4 choice [1-3]: " -e -i 1 SERVER_HOST_V4_SETTINGS
-    done
-    # Apply port response
-    case $SERVER_HOST_V4_SETTINGS in
-    1)
-      SERVER_HOST_V4="$(curl -4 -s 'https://ipengine.dev' | jq -r '.ip')"
-      ;;
-    2)
-      SERVER_HOST_V4=$(ip addr | grep 'inet' | grep -v inet6 | grep -vE '127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | head -1)
-      ;;
-    3)
-      read -rp "Custom IPV4: " -e -i "$(curl -4 -s 'https://ipengine.dev' | jq -r '.ip')" SERVER_HOST_V4
-      ;;
-    esac
-  }
-
-  # Set Port
-  test-connectivity-v4
-
-  # Determine ipv6
-  function test-connectivity-v6() {
-    echo "How would you like to detect IPV6?"
-    echo "  1) Curl (Recommended)"
-    echo "  2) IP (Advanced)"
-    echo "  3) Custom (Advanced)"
-    until [[ "$SERVER_HOST_V6_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "ipv6 choice [1-3]: " -e -i 1 SERVER_HOST_V6_SETTINGS
-    done
-    # Apply port response
-    case $SERVER_HOST_V6_SETTINGS in
-    1)
-      SERVER_HOST_V6="$(curl -6 -s 'https://ipengine.dev' | jq -r '.ip')"
-      ;;
-    2)
-      SERVER_HOST_V6=$(ip r get to 2001:4860:4860::8888 | perl -ne '/src ([\w:]+)/ && print "$1\n"')
-      ;;
-    3)
-      read -rp "Custom IPV6: " -e -i "$(curl -6 -s 'https://ipengine.dev' | jq -r '.ip')" SERVER_HOST_V6
-      ;;
-    esac
-  }
-
-  # Set Port
-  test-connectivity-v6
-
-  # Determine ipv6
-  function server-pub-nic() {
-    echo "How would you like to detect IPV6?"
-    echo "  1) IP (Recommended)"
-    echo "  2) Custom (Advanced)"
-    until [[ "$SERVER_PUB_NIC_SETTINGS" =~ ^[1-2]$ ]]; do
-      read -rp "nic choice [1-2]: " -e -i 1 SERVER_PUB_NIC_SETTINGS
-    done
-    # Apply port response
-    case $SERVER_PUB_NIC_SETTINGS in
-    1)
-      SERVER_PUB_NIC="$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)"
-      ;;
-    2)
-      read -rp "Custom NAT: " -e -i "$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)" SERVER_PUB_NIC
-      ;;
-    esac
-  }
-
-  # Set Port
-  server-pub-nic
-
-  # Determine host port
-  function set-port() {
-    echo "What port do you want WireGuard server to listen to?"
-    echo "  1) 51820 (Recommended)"
-    echo "  2) Custom (Advanced)"
-    echo "  3) Random [1024-65535]"
-    until [[ "$SERVER_PORT_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "Port choice [1-3]: " -e -i 1 SERVER_PORT_SETTINGS
-    done
-    # Apply port response
-    case $SERVER_PORT_SETTINGS in
-    1)
-      SERVER_PORT="51820"
-      ;;
-    2)
-      until [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] && [ "$SERVER_PORT" -ge 1 ] && [ "$SERVER_PORT" -le 65535 ]; do
-        read -rp "Custom port [1-65535]: " -e -i 51820 SERVER_PORT
-      done
-      ;;
-    3)
-      SERVER_PORT=$(shuf -i1024-65535 -n1)
-      echo "Random Port: $SERVER_PORT"
-      ;;
-    esac
-  }
-
-  # Set Port
-  set-port
-
-  # Determine Keepalive interval.
-  function nat-keepalive() {
-    echo "What do you want your keepalive interval to be?"
-    echo "  1) 25 (Default)"
-    echo "  2) Custom (Advanced)"
-    echo "  3) Random [1-25]"
-    until [[ "$NAT_CHOICE_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "Nat Choice [1-3]: " -e -i 1 NAT_CHOICE_SETTINGS
-    done
-    # Nat Choices
-    case $NAT_CHOICE_SETTINGS in
-    1)
-      NAT_CHOICE="25"
-      ;;
-    2)
-      until [[ "$NAT_CHOICE" =~ ^[0-9]+$ ]] && [ "$NAT_CHOICE" -ge 1 ] && [ "$NAT_CHOICE" -le 25 ]; do
-        read -rp "Custom NAT [0-25]: " -e -i 25 NAT_CHOICE
-      done
-      ;;
-    3)
-      NAT_CHOICE=$(shuf -i1-25 -n1)
-      ;;
-    esac
-  }
-
-  # Keepalive
-  nat-keepalive
-
-  # Custom MTU or default settings
-  function mtu-set() {
-    echo "What MTU do you want to use?"
-    echo "  1) 1280 (Recommended)"
-    echo "  2) 1420"
-    echo "  3) Custom (Advanced)"
-    until [[ "$MTU_CHOICE_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "MTU choice [1-3]: " -e -i 1 MTU_CHOICE_SETTINGS
-    done
-    case $MTU_CHOICE_SETTINGS in
-    1)
-      MTU_CHOICE="1280"
-      ;;
-    2)
-      MTU_CHOICE="1420"
-      ;;
-    3)
-      until [[ "$MTU_CHOICE" =~ ^[0-9]+$ ]] && [ "$MTU_CHOICE" -ge 1 ] && [ "$MTU_CHOICE" -le 1500 ]; do
-        read -rp "Custom MTU [1-1500]: " -e -i 1280 MTU_CHOICE
-      done
-      ;;
-    esac
-  }
-
-  # Set MTU
-  mtu-set
-
-  # What ip version would you like to be available on this VPN?
-  function ipvx-select() {
-    echo "What IPv do you want to use to connect to WireGuard server?"
-    echo "  1) IPv4 (Recommended)"
-    echo "  2) IPv6"
-    echo "  3) Custom (Advanced)"
-    until [[ "$SERVER_HOST_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "IP Choice [1-3]: " -e -i 1 SERVER_HOST_SETTINGS
-    done
-    case $SERVER_HOST_SETTINGS in
-    1)
-      SERVER_HOST="$SERVER_HOST_V4"
-      ;;
-    2)
-      SERVER_HOST="[$SERVER_HOST_V6]"
-      ;;
-    3)
-      read -rp "Custom Domain: " -e -i "$(curl --silent icanhazptr.com)" SERVER_HOST
-      ;;
-    esac
-  }
-
-  # IPv4 or IPv6 Selector
-  ipvx-select
-
-  # Do you want to disable IPv4 or IPv6 or leave them both enabled?
-  function disable-ipvx() {
-    echo "Do you want to disable IPv4 or IPv6 on the server?"
-    echo "  1) No (Recommended)"
-    echo "  2) Disable IPV4"
-    echo "  3) Disable IPV6"
-    until [[ "$DISABLE_HOST_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "Disable Host Choice [1-3]: " -e -i 1 DISABLE_HOST_SETTINGS
-    done
-    case $DISABLE_HOST_SETTINGS in
-    1)
-      DISABLE_HOST="$(
-        echo "net.ipv4.ip_forward=1" >>/etc/sysctl.d/wireguard.conf
-        echo "net.ipv6.conf.all.forwarding=1" >>/etc/sysctl.d/wireguard.conf
-        sysctl --system
-      )"
-      ;;
-    2)
-      DISABLE_HOST="$(
-        echo "net.ipv4.conf.all.disable_ipv4=1" >>/etc/sysctl.d/wireguard.conf
-        echo "net.ipv4.conf.default.disable_ipv4=1" >>/etc/sysctl.d/wireguard.conf
-        echo "net.ipv6.conf.all.forwarding=1" >>/etc/sysctl.d/wireguard.conf
-        sysctl --system
-      )"
-      ;;
-    3)
-      # shellcheck disable=SC2034
-      DISABLE_HOST="$(
-        echo "net.ipv6.conf.all.disable_ipv6 = 1" >>/etc/sysctl.d/wireguard.conf
-        echo "net.ipv6.conf.default.disable_ipv6 = 1" >>/etc/sysctl.d/wireguard.conf
-        echo "net.ipv6.conf.lo.disable_ipv6 = 1" >>/etc/sysctl.d/wireguard.conf
-        echo "net.ipv4.ip_forward=1" >>/etc/sysctl.d/wireguard.conf
-        sysctl --system
-      )"
-      ;;
-    esac
-  }
-
-  # Disable Ipv4 or Ipv6
-  disable-ipvx
-
-  # Would you like to allow connections to your LAN neighbors?
-  function client-allowed-ip() {
-    echo "What traffic do you want the client to forward to wireguard?"
-    echo "  1) Everything (Recommended)"
-    echo "  2) Exclude Private IPs"
-    echo "  3) Custom (Advanced)"
-    until [[ "$CLIENT_ALLOWED_IP_SETTINGS" =~ ^[1-3]$ ]]; do
-      read -rp "Client Allowed IP Choice [1-3]: " -e -i 1 CLIENT_ALLOWED_IP_SETTINGS
-    done
-    case $CLIENT_ALLOWED_IP_SETTINGS in
-    1)
-      CLIENT_ALLOWED_IP="0.0.0.0/0,::/0"
-      ;;
-    2)
-      CLIENT_ALLOWED_IP="0.0.0.0/5,8.0.0.0/7,11.0.0.0/8,12.0.0.0/6,16.0.0.0/4,32.0.0.0/3,64.0.0.0/2,128.0.0.0/3,160.0.0.0/5,168.0.0.0/6,172.0.0.0/12,172.32.0.0/11,172.64.0.0/10,172.128.0.0/9,173.0.0.0/8,174.0.0.0/7,176.0.0.0/4,192.0.0.0/9,192.128.0.0/11,192.160.0.0/13,192.169.0.0/16,192.170.0.0/15,192.172.0.0/14,192.176.0.0/12,192.192.0.0/10,193.0.0.0/8,194.0.0.0/7,196.0.0.0/6,200.0.0.0/5,208.0.0.0/4,::/0,176.103.130.130/32,176.103.130.131/32"
-      ;;
-    3)
-      read -rp "Custom IPs: " -e -i "0.0.0.0/0,::/0" CLIENT_ALLOWED_IP
-      ;;
-    esac
-  }
-
-  # Traffic Forwarding
-  client-allowed-ip
-
-  # Would you like to install Unbound.
-  function ask-install-dns() {
-    if [ "$INSTALL_UNBOUND" == "" ]; then
-      # shellcheck disable=SC2034
-      read -rp "Do You Want To Install Unbound (y/n): " -e -i y INSTALL_UNBOUND
-    fi
-    if [ "$INSTALL_UNBOUND" == "n" ]; then
-      echo "Which DNS do you want to use with the VPN?"
-      echo "  1) AdGuard (Recommended)"
-      echo "  2) Google"
-      echo "  3) OpenDNS"
-      echo "  4) Cloudflare"
-      echo "  5) Verisign"
-      echo "  6) Quad9"
-      echo "  7) FDN"
-      echo "  8) DNS.WATCH"
-      echo "  9) Custom (Advanced)"
-    until [[ "$CLIENT_DNS_SETTINGS" =~ ^[1-9]$ ]]; do
-      read -rp "DNS [1-9]: " -e -i 1 CLIENT_DNS_SETTINGS
-    done
-      case $CLIENT_DNS_SETTINGS in
-      1)
-        CLIENT_DNS="176.103.130.130,176.103.130.131,2a00:5a60::ad1:0ff,2a00:5a60::ad2:0ff"
-        ;;
-      2)
-        CLIENT_DNS="8.8.8.8,8.8.4.4,2001:4860:4860::8888,2001:4860:4860::8844"
-        ;;
-      3)
-        CLIENT_DNS="208.67.222.222,208.67.220.220,2620:119:35::35,2620:119:53::53"
-        ;;
-      4)
-        CLIENT_DNS="1.1.1.1,1.0.0.1,2606:4700:4700::1111,2606:4700:4700::1001"
-        ;;
-      5)
-        CLIENT_DNS="64.6.64.6,64.6.65.6,2620:74:1b::1:1,2620:74:1c::2:2"
-        ;;
-      6)
-        CLIENT_DNS="9.9.9.9,149.112.112.112,2620:fe::fe,2620:fe::9"
-        ;;
-      7)
-        CLIENT_DNS="80.67.169.40,80.67.169.12,2001:910:800::40,2001:910:800::12"
-        ;;
-      8)
-        CLIENT_DNS="84.200.69.80,84.200.70.40,2001:1608:10:25::1c04:b12f,2001:1608:10:25::9249:d69b"
-        ;;
-      9)
-        read -rp "Custom DNS (IPv4 IPv6):" -e -i "176.103.130.130,2a00:5a60::ad1:0ff" CLIENT_DNS
-        ;;
-      esac
-    fi
-  }
-
-  # Ask To Install DNS
-  ask-install-dns
-
-  # What would you like to name your first WireGuard peer?
-  function client-name() {
-    if [ "$CLIENT_NAME" == "" ]; then
-      echo "Lets name the WireGuard Peer, Use one word only, no special characters. (No Spaces)"
-      read -rp "Client name: " -e CLIENT_NAME
-    fi
-  }
-
-  # Client Name
-  client-name
-
-  # Install WireGuard Server
-  function install-wireguard-server() {
-    # Installation begins here
-    # shellcheck disable=SC2235
-    if [ "$DISTRO" == "ubuntu" ] && ([ "$DISTRO_VERSION" == "20.04" ] || [ "$DISTRO_VERSION" == "19.10" ]); then
-      apt-get update
-      apt-get install linux-headers-"$(uname -r)" -y
-      apt-get install wireguard qrencode haveged ifupdown -y
-    fi
-    # shellcheck disable=SC2235
-    if [ "$DISTRO" == "ubuntu" ] && ([ "$DISTRO_VERSION" == "16.04" ] || [ "$DISTRO_VERSION" == "18.04" ]); then
-      apt-get update
-      apt-get install software-properties-common -y
-      add-apt-repository ppa:wireguard/wireguard -y
-      apt-get update
-      apt-get install linux-headers-"$(uname -r)" -y
-      apt-get install wireguard qrencode haveged ifupdown -y
-    fi
-    if [ "$DISTRO" == "debian" ]; then
-      apt-get update
-      echo "deb http://deb.debian.org/debian/ unstable main" >>/etc/apt/sources.list.d/unstable.list
-      # shellcheck disable=SC1117
-      printf "Package: *\nPin: release a=unstable\nPin-Priority: 90\n" >>/etc/apt/preferences.d/limit-unstable
-      apt-get update
-      apt-get install linux-headers-"$(uname -r)" -y
-      apt-get install wireguard qrencode haveged ifupdown -y
-    fi
-    if [ "$DISTRO" == "raspbian" ]; then
-      apt-get update
-      apt-get install dirmngr -y
-      apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 04EE7237B7D453EC
-      echo "deb http://deb.debian.org/debian/ unstable main" >>/etc/apt/sources.list.d/unstable.list
-      # shellcheck disable=SC1117
-      printf "Package: *\nPin: release a=unstable\nPin-Priority: 90\n" >>/etc/apt/preferences.d/limit-unstable
-      apt-get update
-      apt-get install raspberrypi-kernel-headers -y
-      apt-get install wireguard qrencode haveged ifupdown -y
-    fi
-    if [ "$DISTRO" == "arch" ]; then
-      pacman -Syu
-      pacman -Syu --noconfirm linux-headers
-      pacman -Syu --noconfirm haveged qrencode iptables
-      pacman -Syu --noconfirm wireguard-tools wireguard-arch
-    fi
-    if [ "$DISTRO" = "fedora" ] && [ "$DISTRO_VERSION" == "32" ]; then
-      dnf update -y
-      dnf install kernel-headers-"$(uname -r)" kernel-devel-"$(uname -r)" -y
-      dnf install qrencode wireguard-tools haveged -y
-    fi
-    # shellcheck disable=SC2235
-    if [ "$DISTRO" = "fedora" ] && ([ "$DISTRO_VERSION" == "30" ] || [ "$DISTRO_VERSION" == "31" ]); then
-      dnf update -y
-      dnf copr enable jdoss/wireguard -y
-      dnf install kernel-headers-"$(uname -r)" kernel-devel-"$(uname -r)" -y
-      dnf install qrencode wireguard-dkms wireguard-tools haveged -y
-    fi
-    if [ "$DISTRO" == "centos" ] && [ "$DISTRO_VERSION" == "8" ]; then
-      yum update -y
-      yum install epel-release -y
-      yum update -y
-      yum install kernel-headers-"$(uname -r)" kernel-devel-"$(uname -r)" -y
-      yum config-manager --set-enabled PowerTools
-      yum copr enable jdoss/wireguard -y
-      yum install wireguard-dkms wireguard-tools qrencode haveged -y
-    fi
-    if [ "$DISTRO" == "centos" ] && [ "$DISTRO_VERSION" == "7" ]; then
-      yum update -y
-      curl https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-7/jdoss-wireguard-epel-7.repo --create-dirs -o /etc/yum.repos.d/wireguard.repo
-      yum update -y
-      yum install epel-release -y
-      yum update -y
-      yum install kernel-headers-"$(uname -r)" kernel-devel-"$(uname -r)" -y
-      yum install wireguard-dkms wireguard-tools qrencode haveged -y
-    fi
-    if [ "$DISTRO" == "rhel" ] && [ "$DISTRO_VERSION" == "8" ]; then
-      yum update -y
-      yum install https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
-      yum update -y
-      # shellcheck disable=SC2046
-      subscription-manager repos --enable codeready-builder-for-rhel-8-$(arch)-rpms
-      yum copr enable jdoss/wireguard
-      yum install wireguard-dkms wireguard-tools qrencode haveged -y
-    fi
-    if [ "$DISTRO" == "rhel" ] && [ "$DISTRO_VERSION" == "7" ]; then
-      yum update -y
-      curl https://copr.fedorainfracloud.org/coprs/jdoss/wireguard/repo/epel-7/jdoss-wireguard-epel-7.repo --create-dirs -o /etc/yum.repos.d/wireguard.repo
-      yum update -y
-      yum install epel-release -y
-      yum install kernel-headers-"$(uname -r)" kernel-devel-"$(uname -r)" -y
-      yum install wireguard-dkms wireguard-tools qrencode haveged -y
-    fi
-  }
-
-  # Install WireGuard Server
-  install-wireguard-server
-
-  # Function to install unbound
-  function install-unbound() {
-    if [ "$INSTALL_UNBOUND" = "y" ]; then
-      # Installation Begins Here
-      if [ "$DISTRO" == "ubuntu" ]; then
-        # Install Unbound
-        apt-get install unbound unbound-host e2fsprogs resolvconf -y
-        if pgrep systemd-journal; then
-          systemctl stop systemd-resolved
-          systemctl disable systemd-resolved
-        else
-          service systemd-resolved stop
-          service systemd-resolved disable
-        fi
-      fi
-      if [ "$DISTRO" == "debian" ]; then
-        apt-get install unbound unbound-host e2fsprogs resolvconf -y
-      fi
-      if [ "$DISTRO" == "raspbian" ]; then
-        apt-get install unbound unbound-host e2fsprogs resolvconf -y
-      fi
-      if [ "$DISTRO" == "centos" ] && [ "$DISTRO_VERSION" == "8" ]; then
-        yum install unbound unbound-libs -y
-      fi
-      if [ "$DISTRO" == "centos" ] && [ "$DISTRO_VERSION" == "7" ]; then
-        yum install unbound unbound-libs resolvconf -y
-      fi
-      if [ "$DISTRO" == "rhel" ]; then
-        yum install unbound unbound-libs -y
-      fi
-      if [ "$DISTRO" == "fedora" ]; then
-        dnf install unbound -y
-      fi
-      if [ "$DISTRO" == "arch" ]; then
-        pacman -Syu --noconfirm unbound resolvconf
-      fi
-      # Remove Unbound Config
-      rm -f /etc/unbound/unbound.conf
-      # Set Config for unbound
-      echo "server:
-    num-threads: 4
-    verbosity: 1
-    root-hints: /etc/unbound/root.hints
-    # auto-trust-anchor-file: /var/lib/unbound/root.key
-    interface: 0.0.0.0
-    interface: ::0
-    max-udp-size: 3072
-    access-control: 0.0.0.0/0                 refuse
-    access-control: ::0                       refuse
-    access-control: $PRIVATE_SUBNET_V4               allow
-    access-control: $PRIVATE_SUBNET_V6          allow
-    access-control: 127.0.0.1                 allow
-    private-address: $PRIVATE_SUBNET_V4
-    private-address: $PRIVATE_SUBNET_V6
-    hide-identity: yes
-    hide-version: yes
-    harden-glue: yes
-    harden-dnssec-stripped: yes
-    harden-referral-path: yes
-    unwanted-reply-threshold: 10000000
-    val-log-level: 1
-    cache-min-ttl: 1800
-    cache-max-ttl: 14400
-    prefetch: yes
-    qname-minimisation: yes
-    prefetch-key: yes" >>/etc/unbound/unbound.conf
-      # Set DNS Root Servers
-      curl https://www.internic.net/domain/named.cache --create-dirs -o /etc/unbound/root.hints
-      # Setting Client DNS For Unbound On WireGuard
-      CLIENT_DNS="$GATEWAY_ADDRESS_V4,$GATEWAY_ADDRESS_V6"
-      # Allow the modification of the file
-      chattr -i /etc/resolv.conf
-      # Disable previous DNS servers
-      sed -i "s|nameserver|#nameserver|" /etc/resolv.conf
-      sed -i "s|search|#search|" /etc/resolv.conf
-      # Set localhost as the DNS resolver
-      echo "nameserver 127.0.0.1" >>/etc/resolv.conf
-      # Diable the modification of the file
-      chattr +i /etc/resolv.conf
-    fi
-    if pgrep systemd-journal; then
-      systemctl enable unbound
-      systemctl restart unbound
-    else
-      service unbound enable
-      service unbound restart
-    fi
-  }
-
-  # Running Install Unbound
-  install-unbound
-
-  # WireGuard Set Config
-  function wireguard-setconf() {
-    SERVER_PRIVKEY=$(wg genkey)
-    SERVER_PUBKEY=$(echo "$SERVER_PRIVKEY" | wg pubkey)
-    CLIENT_PRIVKEY=$(wg genkey)
-    CLIENT_PUBKEY=$(echo "$CLIENT_PRIVKEY" | wg pubkey)
-    CLIENT_ADDRESS_V4="${PRIVATE_SUBNET_V4::-4}3"
-    CLIENT_ADDRESS_V6="${PRIVATE_SUBNET_V6::-4}3"
-    PRESHARED_KEY=$(wg genpsk)
-    PEER_PORT=$(shuf -i1024-65535 -n1)
-    mkdir -p /etc/wireguard
-    mkdir -p /etc/wireguard/clients
-    touch $WG_CONFIG && chmod 600 $WG_CONFIG
-    # Set Wireguard settings for this host and first peer.
-
-    echo "# $PRIVATE_SUBNET_V4 $PRIVATE_SUBNET_V6 $SERVER_HOST:$SERVER_PORT $SERVER_PUBKEY $CLIENT_DNS $MTU_CHOICE $NAT_CHOICE $CLIENT_ALLOWED_IP
-[Interface]
-Address = $GATEWAY_ADDRESS_V4/$PRIVATE_SUBNET_MASK_V4,$GATEWAY_ADDRESS_V6/$PRIVATE_SUBNET_MASK_V6
-ListenPort = $SERVER_PORT
-PrivateKey = $SERVER_PRIVKEY
-PostUp = iptables -A FORWARD -i $WIREGUARD_PUB_NIC -j ACCEPT; iptables -t nat -A POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE; ip6tables -A FORWARD -i $WIREGUARD_PUB_NIC -j ACCEPT; ip6tables -t nat -A POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE; iptables -A INPUT -s $PRIVATE_SUBNET_V4 -p udp -m udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT; ip6tables -A INPUT -s $PRIVATE_SUBNET_V6 -p udp -m udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-PostDown = iptables -D FORWARD -i $WIREGUARD_PUB_NIC -j ACCEPT; iptables -t nat -D POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE; ip6tables -D FORWARD -i $WIREGUARD_PUB_NIC -j ACCEPT; ip6tables -t nat -D POSTROUTING -o $SERVER_PUB_NIC -j MASQUERADE; iptables -D INPUT -s $PRIVATE_SUBNET_V4 -p udp -m udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT; iptables -D INPUT -s $PRIVATE_SUBNET_V6 -p udp -m udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-SaveConfig = false
-# $CLIENT_NAME start
-[Peer]
-PublicKey = $CLIENT_PUBKEY
-PresharedKey = $PRESHARED_KEY
-AllowedIPs = $CLIENT_ADDRESS_V4/32,$CLIENT_ADDRESS_V6/128
-# $CLIENT_NAME end" >>$WG_CONFIG
-
-    echo "# $CLIENT_NAME
-[Interface]
-Address = $CLIENT_ADDRESS_V4/$PRIVATE_SUBNET_MASK_V4,$CLIENT_ADDRESS_V6/$PRIVATE_SUBNET_MASK_V6
-DNS = $CLIENT_DNS
-ListenPort = $PEER_PORT
-MTU = $MTU_CHOICE
-PrivateKey = $CLIENT_PRIVKEY
-[Peer]
-AllowedIPs = $CLIENT_ALLOWED_IP
-Endpoint = $SERVER_HOST:$SERVER_PORT
-PersistentKeepalive = $NAT_CHOICE
-PresharedKey = $PRESHARED_KEY
-PublicKey = $SERVER_PUBKEY" >>/etc/wireguard/clients/"$CLIENT_NAME"-$WIREGUARD_PUB_NIC.conf
-    # Generate QR Code
-    qrencode -t ansiutf8 -l L </etc/wireguard/clients/"$CLIENT_NAME"-$WIREGUARD_PUB_NIC.conf
-    # Echo the file
-    echo "Client Config --> /etc/wireguard/clients/$CLIENT_NAME-$WIREGUARD_PUB_NIC.conf"
-    if pgrep systemd-journal; then
-      systemctl enable wg-quick@$WIREGUARD_PUB_NIC
-      systemctl restart wg-quick@$WIREGUARD_PUB_NIC
-    else
-      service wg-quick@$WIREGUARD_PUB_NIC enable
-      service wg-quick@$WIREGUARD_PUB_NIC restart
-    fi
-  }
-
-  # Setting Up Wireguard Config
-  wireguard-setconf
-
-# After WireGuard Install
-else
-
-  # Already installed what next?
-  function wireguard-next-questions() {
-    echo "What do you want to do?"
-    echo "   1) Show WireGuard Interface"
-    echo "   2) Start WireGuard Interface"
-    echo "   3) Stop WireGuard Interface"
-    echo "   4) Restart WireGuard Interface"
-    echo "   5) Add WireGuard Peer"
-    echo "   6) Remove WireGuard Peer"
-    echo "   7) Reinstall WireGuard Interface"
-    echo "   8) Uninstall WireGuard Interface"
-    echo "   9) Update this script"
-    until [[ "$WIREGUARD_OPTIONS" =~ ^[1-9]$ ]]; do
-      read -rp "Select an Option [1-9]: " -e -i 1 WIREGUARD_OPTIONS
-    done
-    case $WIREGUARD_OPTIONS in
-    1)
-      if pgrep systemd-journal; then
-        wg show
-      else
-        wg show
-      fi
-      ;;
-    2)
-      if pgrep systemd-journal; then
-        systemctl start wg-quick@$WIREGUARD_PUB_NIC
-      else
-        service wg-quick@$WIREGUARD_PUB_NIC start
-      fi
-      ;;
-    3)
-      if pgrep systemd-journal; then
-        systemctl stop wg-quick@$WIREGUARD_PUB_NIC
-      else
-        service wg-quick@$WIREGUARD_PUB_NIC stop
-      fi
-      ;;
-    4)
-      if pgrep systemd-journal; then
-        systemctl restart wg-quick@$WIREGUARD_PUB_NIC
-      else
-        service wg-quick@$WIREGUARD_PUB_NIC restart
-      fi
-      ;;
-    5)
-    if [ "$NEW_CLIENT_NAME" == "" ]; then
-      echo "Lets name the WireGuard Peer, Use one word only, no special characters. (No Spaces)"
-      read -rp "New client name: " -e NEW_CLIENT_NAME
-    fi
-      CLIENT_PRIVKEY=$(wg genkey)
-      CLIENT_PUBKEY=$(echo "$CLIENT_PRIVKEY" | wg pubkey)
-      PRESHARED_KEY=$(wg genpsk)
-      PEER_PORT=$(shuf -i1024-65535 -n1)
-      PRIVATE_SUBNET_V4=$(head -n1 $WG_CONFIG | awk '{print $2}')
-      PRIVATE_SUBNET_MASK_V4=$(echo "$PRIVATE_SUBNET_V4" | cut -d "/" -f 2)
-      PRIVATE_SUBNET_V6=$(head -n1 $WG_CONFIG | awk '{print $3}')
-      PRIVATE_SUBNET_MASK_V6=$(echo "$PRIVATE_SUBNET_V6" | cut -d "/" -f 2)
-      SERVER_HOST=$(head -n1 $WG_CONFIG | awk '{print $4}')
-      SERVER_PUBKEY=$(head -n1 $WG_CONFIG | awk '{print $5}')
-      CLIENT_DNS=$(head -n1 $WG_CONFIG | awk '{print $6}')
-      MTU_CHOICE=$(head -n1 $WG_CONFIG | awk '{print $7}')
-      NAT_CHOICE=$(head -n1 $WG_CONFIG | awk '{print $8}')
-      CLIENT_ALLOWED_IP=$(head -n1 $WG_CONFIG | awk '{print $9}')
-      LASTIP4=$(grep "/32" $WG_CONFIG | tail -n1 | awk '{print $3}' | cut -d "/" -f 1 | cut -d "." -f 4)
-      LASTIP6=$(grep "/128" $WG_CONFIG | tail -n1 | awk '{print $3}' | cut -d "/" -f 1 | cut -d "." -f 4)
-      CLIENT_ADDRESS_V4="${PRIVATE_SUBNET_V4::-4}$((LASTIP4 + 1))"
-      CLIENT_ADDRESS_V6="${PRIVATE_SUBNET_V6::-4}$((LASTIP6 + 1))"
-      echo "# $NEW_CLIENT_NAME start
-[Peer]
-PublicKey = $CLIENT_PUBKEY
-PresharedKey = $PRESHARED_KEY
-AllowedIPs = $CLIENT_ADDRESS_V4/32,$CLIENT_ADDRESS_V6/128
-# $NEW_CLIENT_NAME end" >>$WG_CONFIG
-      echo "# $NEW_CLIENT_NAME
-[Interface]
-Address = $CLIENT_ADDRESS_V4/$PRIVATE_SUBNET_MASK_V4,$CLIENT_ADDRESS_V6/$PRIVATE_SUBNET_MASK_V6
-DNS = $CLIENT_DNS
-ListenPort = $PEER_PORT
-MTU = $MTU_CHOICE
-PrivateKey = $CLIENT_PRIVKEY
-[Peer]
-AllowedIPs = $CLIENT_ALLOWED_IP
-Endpoint = $SERVER_HOST$SERVER_PORT
-PersistentKeepalive = $NAT_CHOICE
-PresharedKey = $PRESHARED_KEY
-PublicKey = $SERVER_PUBKEY" >>/etc/wireguard/clients/"$NEW_CLIENT_NAME"-$WIREGUARD_PUB_NIC.conf
-      qrencode -t ansiutf8 -l L </etc/wireguard/clients/"$NEW_CLIENT_NAME"-$WIREGUARD_PUB_NIC.conf
-      echo "Client config --> /etc/wireguard/clients/$NEW_CLIENT_NAME-$WIREGUARD_PUB_NIC.conf"
-      # Restart WireGuard
-      if pgrep systemd-journal; then
-        systemctl restart wg-quick@$WIREGUARD_PUB_NIC
-      else
-        service wg-quick@$WIREGUARD_PUB_NIC restart
-      fi
-      ;;
-    6)
-      # Remove User
-      echo "Which WireGuard User Do You Want To Remove?"
-      # shellcheck disable=SC2002
-      cat $WG_CONFIG | grep start | awk '{ print $2 }'
-      read -rp "Type in Client Name : " -e REMOVECLIENT
-      read -rp "Are you sure you want to remove $REMOVECLIENT ? (y/n): " -n 1 -r
-      if [[ $REPLY =~ ^[Yy]$ ]]; then
-        # shellcheck disable=SC1117
-        echo sed -i "/\# $REMOVECLIENT start/,/\# $REMOVECLIENT end/d" $WG_CONFIG
-        rm /etc/wireguard/clients/"$REMOVECLIENT"-$WIREGUARD_PUB_NIC.conf
-        echo "Client named $REMOVECLIENT has been removed."
-      fi
-      if [[ $REPLY =~ ^[Nn]$ ]]; then
-        exit
-      fi
-      if pgrep systemd-journal; then
-        systemctl restart wg-quick@$WIREGUARD_PUB_NIC
-      else
-        service wg-quick@$WIREGUARD_PUB_NIC restart
-      fi
-      ;;
-    7)
-      if pgrep systemd-journal; then
-        dpkg-reconfigure wireguard-dkms
-        modprobe wireguard
-        systemctl restart wg-quick@$WIREGUARD_PUB_NIC
-      else
-        dpkg-reconfigure wireguard-dkms
-        modprobe wireguard
-        service wg-quick@$WIREGUARD_PUB_NIC restart
-      fi
-      ;;
-    8)
-      # Uninstall Wireguard and purging files
-      # shellcheck disable=SC2034
-      read -rp "Do you really want to remove Wireguard? [y/n]: " -e -i n REMOVE_WIREGUARD
-      if [ "$REMOVE_WIREGUARD" = "y" ]; then
-        # Stop WireGuard
-        if pgrep systemd-journal; then
-          # Disable WireGuard
-          systemctl disable wg-quick@$WIREGUARD_PUB_NIC
-          wg-quick down $WIREGUARD_PUB_NIC
-          # Disable Unbound
-          systemctl disable unbound
-          systemctl stop unbound
-        else
-          # Disable WireGuard
-          service wg-quick@$WIREGUARD_PUB_NIC disable
-          wg-quick down $WIREGUARD_PUB_NIC
-          # Disable Unbound
-          service unbound disable
-          service unbound stop
-        fi
-        if [ "$DISTRO" == "centos" ]; then
-          yum remove wireguard qrencode haveged unbound unbound-host -y
-        elif [ "$DISTRO" == "debian" ]; then
-          apt-get remove --purge wireguard qrencode haveged unbound unbound-host -y
-          rm -f /etc/apt/sources.list.d/unstable.list
-          rm -f /etc/apt/preferences.d/limit-unstable
-        elif [ "$DISTRO" == "ubuntu" ]; then
-          apt-get remove --purge wireguard qrencode haveged unbound unbound-host -y
-        elif [ "$DISTRO" == "raspbian" ]; then
-          apt-key del 04EE7237B7D453EC
-          apt-get remove --purge wireguard qrencode haveged unbound unbound-host dirmngr -y
-          rm -f /etc/apt/sources.list.d/unstable.list
-          rm -f /etc/apt/preferences.d/limit-unstable
-        elif [ "$DISTRO" == "arch" ]; then
-          pacman -Rs wireguard qrencode haveged unbound unbound-host -y
-        elif [ "$DISTRO" == "fedora" ]; then
-          dnf remove wireguard qrencode haveged unbound -y
-          rm -f /etc/yum.repos.d/wireguard.repo
-        elif [ "$DISTRO" == "rhel" ]; then
-          yum remove wireguard qrencode haveged unbound unbound-host -y
-          rm -f /etc/yum.repos.d/wireguard.repo
-        fi
-        # Removing Wireguard User Config Files
-        rm -rf /etc/wireguard/clients
-        # Removing Wireguard Files
-        rm -rf /etc/wireguard
-        # Removing system wireguard config
-        rm -f /etc/sysctl.d/wireguard.conf
-        # Removing wireguard config
-        rm -f /etc/wireguard/$WIREGUARD_PUB_NIC.conf
-        # Removing Unbound Config
-        rm -f /etc/unbound/unbound.conf
-        # Removing Unbound Files
-        rm -rf /etc/unbound
-        # Allow the modification of the file
-        chattr -i /etc/resolv.conf
-        # Remove localhost as the resolver
-        sed -i "s|nameserver 127.0.0.1||" /etc/resolv.conf
-        # Remove the old resolv.conf file
-        sed -i "s|#nameserver|nameserver|" /etc/resolv.conf
-        sed -i "s|#search|search|" /etc/resolv.conf
-        # Diable the modification of the file
-        chattr +i /etc/resolv.conf
-      fi
-      ;;
-    9) ## Update the script
-      curl -o /etc/wireguard/wireguard-server.sh https://raw.githubusercontent.com/complexorganizations/wireguard-installer-manager/master/wireguard-server.sh
-      chmod +x /etc/wireguard/wireguard-server.sh || exit
-      ;;
-    esac
-  }
-
-  # Running Questions Command
-  wireguard-next-questions
-
+	installWireGuard
 fi
