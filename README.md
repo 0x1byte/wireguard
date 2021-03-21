@@ -9,6 +9,6 @@ Download and execute the script. Answer the questions asked by the script and it
 
 ```bash
 curl -O https://raw.githubusercontent.com/0x1byte/wireguard/main/wireguard-server.sh
-chmod +x wireguard-install.sh
-./wireguard-install.sh
+chmod +x wireguard-server.sh
+./wireguard-server.sh
 ```
